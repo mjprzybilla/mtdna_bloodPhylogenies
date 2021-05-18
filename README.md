@@ -8,9 +8,9 @@ This repository was created to store and provide all scripts used in the rotatio
 
 It should be noted that the scripts for the generation and analysis of the underlying blood phylogenies are not excluded here, but can be found at the respective Github pages accompanying the manuscripts by *Spencer-Chapman et al.* [https://github.com/mspencerchapman/Phylogeny_of_foetal_haematopoiesis] and *Mitchell et al.*. Also, all information regarding the data used in these studies  
 
-**Figure01** - Assembling a computational workflow for single-cell RNA-sequencing analysis
+**Figure01** - Mapping features of the mitochondrial genome to somatic phylogenies.
 
-**Figure02** - Evaluating the performance of single-cell RNA copy number estimation methods
+**Figure02** - High mitochondrial mutation burden is associated with decreased mtDNA copies.
 
 **Figure03** - Inferring fitness effects from copy number alterations through time
 
