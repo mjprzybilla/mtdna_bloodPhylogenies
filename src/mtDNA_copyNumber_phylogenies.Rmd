@@ -321,11 +321,11 @@ for (i in foetal_ids) {
 inverseA <- bdiag(invA.list)
 row.names(inverseA) <- invA.row.names
 
-# save the data to the cluster
-writeMM(inverseA, "/Users/mp34/team154_campbell/data/blood_foetal/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
-writeMM(inverseA, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/blood_foetal/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
-saveRDS(invA.row.names, "/Users/mp34/team154_campbell/data/blood_foetal/mcmc_model_inverseA_rownames.RData")
-saveRDS(invA.row.names, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/blood_foetal/mcmc_model_inverseA_rownames.RData")
+# # save the data to the cluster
+# writeMM(inverseA, "/Users/mp34/team154_campbell/data/blood_foetal/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
+# writeMM(inverseA, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/blood_foetal/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
+# saveRDS(invA.row.names, "/Users/mp34/team154_campbell/data/blood_foetal/mcmc_model_inverseA_rownames.RData")
+# saveRDS(invA.row.names, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/blood_foetal/mcmc_model_inverseA_rownames.RData")
 
 # check the first rows
 head(mtdna.copynumber.full)
@@ -356,11 +356,18 @@ head(mtdna.copynumber.complete)
 ## VISUALIZE DISTRIBUTIONS OF MTDNA COPY NUMBER AND MUTATION BURDEN
 
 ```{r}
+# Generate a scatter-plot of mtDNA copy number for each clone from the cohort, ordered by disease and patient
+mtdna.copynumber.complete <- mtdna.copynumber.complete %>% group_by(PatientID) %>% mutate(median_mut_burden = median(mutation_burden))
+mtdna.copynumber.complete <- mtdna.copynumber.complete %>% group_by(PatientID) %>% mutate(median_copynumber = median(copy_number))
+mtdna.copynumber.complete$PatientID <- factor(mtdna.copynumber.complete$PatientID, levels = c("PD43947", "PD41768"))
+
 # COPY NUMBER
 ggplot(mtdna.copynumber.complete, aes(PatientID, copy_number, color = Cell_type)) +
   geom_jitter() + 
   theme_classic() + 
   theme(axis.text.x = element_text(angle=65, vjust=0.6)) + 
+  facet_wrap(~ PatientID, scales='free_x', nrow = 1) +
+  geom_hline(aes(yintercept = median_copynumber, group = PatientID), colour = 'red', size = 2) +
   # scale_y_log10() +
   labs(x="",
        y="mtDNA copy number") + 
@@ -373,7 +380,7 @@ ggplot(mtdna.copynumber.complete, aes(PatientID, copy_number, color = Cell_type)
                                     margin = margin(t = 0, r = 10, b = 0, l = 0)), 
         plot.title = element_text(color = "black", size = 14, hjust = .5, face = "bold"), 
         legend.position = "none")
-# ggsave("/Users/mp34/team154_campbell/plots/foetal_blood_CopyNumber.pdf", width = 10, height = 5, dpi = 600)
+ggsave("/Users/mp34/team154_campbell/plots/foetal_blood_CopyNumber.pdf", width = 10, height = 5, dpi = 600)
 
 # LOG TRANSFORMED COPY NUMBER
 ggplot(mtdna.copynumber.complete, aes(PatientID, log10(copy_number), color = Cell_type)) +
@@ -402,9 +409,9 @@ ggplot(ordered.foetal.mut.burden, aes(index, mutation_burden, color = Cell_type)
   geom_point() + 
   theme_classic() +
   facet_wrap(~ PatientID, scales='free_x', nrow = 1) +
+  geom_hline(aes(yintercept = median_mut_burden, group = PatientID), colour = 'red', size = 2) +
   theme(axis.text.x = element_text(angle=65, vjust=0.6)) + 
-  labs(title="mtDNA mutation burden in foetal blood samples",
-       x="Samples",
+  labs(x="Samples",
        y="Mutation Burden (Sum[VAF])") + 
   theme(strip.text = element_text(face="bold", size=16, colour = "black",),
         strip.background = element_rect(fill="lightgrey", colour="black", size=1),
@@ -414,8 +421,8 @@ ggplot(ordered.foetal.mut.burden, aes(index, mutation_burden, color = Cell_type)
         axis.title.y = element_text(color = "black", size = 16, angle = 90, hjust = .5, vjust = .5, face = "bold", 
                                     margin = margin(t = 0, r = 10, b = 0, l = 0)), 
         plot.title = element_text(color = "black", size = 14, hjust = .5, face = "bold"), 
-        legend.position = "bottom")
-# ggsave("/Users/mp34/team154_campbell/plots/blood_foetal_mutation_burden.pdf", width = 10, height = 6, dpi = 600)
+        legend.position = "none")
+ggsave("/Users/mp34/team154_campbell/plots/blood_foetal_mutation_burden.pdf", width = 10, height = 5, dpi = 600)
 
 ```
 ## CALCULATE THE MEDIAN MUTATION BURDEN AND COPY NUMBER

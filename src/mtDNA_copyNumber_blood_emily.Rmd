@@ -1,0 +1,776 @@
+---
+title: "Analysis of mtDNA copy number in large blood phylogenies"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## INTIALISE
+
+```{r, echo=FALSE}
+library(ape)
+library(phytools)
+library(MCMCglmm)
+library(phangorn)
+library(ggplot2)
+library(ggridges)
+library(reshape2)
+library(RColorBrewer)
+library(viridis)
+library(ggtree)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(Matrix)
+library(ggpubr)
+library(boot)
+```
+
+## LOAD DATA
+
+Read in the trees from Mike for the two patients with the main units of organisation being clusters of mutations with each patient which present the distinct branches on the phylogenetic tree.
+
+```{r, fig.width= 8, fig.height= 6}
+# get the tree files and the mutation files
+blood_trees <- list.files("/Users/mp34/team154_campbell/data/blood_emily", pattern = ".tree", full.names = T)
+blood_trees <- blood_trees[grep("_adj", blood_trees)]
+
+# get the sample ids
+blood_ids <- str_split_fixed(basename(blood_trees), "_", 2)[,1] 
+
+# read in metadata
+blood_metadata <- fread("/Users/mp34/team268_martincorena/data/blood_metadata.txt", header = T)
+converted.ids <- blood_metadata[match(blood_ids, blood_metadata$Sample), "PDID"]
+blood_ids <- converted.ids$PDID
+
+# read in the trees and name them
+blood_trees <- lapply(blood_trees, read.tree)
+names(blood_trees) <- blood_ids
+
+# plot the original trees
+plot(blood_trees[[1]], main=names(blood_trees)[1], show.tip.label=F, no.margin = TRUE,  direction="downwards", edge.width = 1.5)
+plot(blood_trees[[2]], main=names(blood_trees)[2], show.tip.label=F, no.margin = TRUE,  direction="downwards", edge.width = 1.5)
+```
+
+```{r}
+# create a dataframe with branch lengths
+blood_tree_dfs <- list()
+
+i <- 1
+for(i in names(blood_trees)){
+  
+  # read in the tree
+  tree <- blood_trees[[i]]
+  blood_tree_df <- as.data.frame(fortify(tree))
+  
+  # subset to interesting columns 
+  blood_tree_df <- blood_tree_df[,c("label", "branch.length")]
+  colnames(blood_tree_df) <- c("SampleID", "Length")
+  
+  # save
+  blood_tree_dfs[[i]] <- blood_tree_df
+  
+}
+
+head(blood_tree_dfs[[1]])
+```
+
+```{r}
+# read in the copy number information
+copynumber.file <- read.csv("/Users/mp34/team268_martincorena/data/whole_genome_coverage_pileup_and_bedtools_annotated.csv", header = T, sep = ",")
+copynumber.file <- copynumber.file[, c("Sample", "Tissue", "pileup_mtDNA_genomes")]
+colnames(copynumber.file) <- c("SampleID", "Tissue", "copy_number")
+
+# only keep the foetal blood infromation
+copynumber.file <- copynumber.file[copynumber.file$Tissue == "blood_emily",]
+
+# calculate median copy number
+median.copynumber <- copynumber.file %>% group_by(Tissue) %>% summarize(median = mean(copy_number, na.rm=TRUE))
+
+# add column and calculate normalized values
+copynumber.file <- merge(copynumber.file, median.copynumber, by = "Tissue")
+copynumber.file$normalized_copynumber <- copynumber.file$copy_number*(copynumber.file$copy_number/copynumber.file$median)
+
+head(copynumber.file)
+```
+
+## GET THE MUTATION BURDEN PER SAMPLE
+
+```{r, echo = FALSE}
+# calculate mitochondrial mutation burden
+# determine the input 
+input.dir <- "/Users/mp34/sanger/team268im/analysis/mtdna/blood_emily"
+
+# read the all patient variant
+pt.shearwater.files <- list.files(input.dir, pattern = "shearwater_snp_all.txt", all.files = T, recursive = T, full.names = T)
+pt.shearwater.files <- pt.shearwater.files[-grep("readpos_|warm_autopsy/|PCAWG", pt.shearwater.files)]
+
+blood.mut.burden <- list()
+i <- 1
+# iterate over each patient
+for (i in 1:length(blood_ids)){
+  
+  patient <- blood_ids[i]
+  cat("\nProcessing Patient", patient,  "\n")
+  
+  if (length(pt.shearwater.files[grep(patient, pt.shearwater.files)]) > 0){
+    
+    # get the shearwater mutations for the patient
+    pt.shearwater.data <- read.table(pt.shearwater.files[grep(patient, pt.shearwater.files)][1], header = T, sep = "\t")
+    pt.shearwater.data$mutations <- paste(pt.shearwater.data$chr, pt.shearwater.data$pos, pt.shearwater.data$ref, pt.shearwater.data$mut, sep = "_")
+  
+  } else {
+    next
+  }
+
+  #####################################################################################
+  # CREATE A SAMPLE TABLE FOR THE MUTATION BURDEN ETC.
+  #####################################################################################
+  
+  # creata a sample table for storing the mitochondrial variants
+  pt.burden.table = data.frame("PatientID" = NA, "SampleID"= NA , "#Mutations_greater_1percentVAF" = NA, "mutation_burden" = NA, check.names=F, stringsAsFactors=F)
+  
+  shearwater.samples <- unique(pt.shearwater.data$sampleID)
+  j <- 1
+  # iterate over each sample
+  for (j in 1:length(shearwater.samples)){
+    
+    sample <- shearwater.samples[j]
+    
+    # get the mutations which have been called by shearwater for the sample
+    sample.shearwater.data <- pt.shearwater.data[pt.shearwater.data$sampleID == sample,]
+    sample.shearwater.data <- sample.shearwater.data[complete.cases(sample.shearwater.data),]
+    
+    # remove mutations lower than 1%
+    sample.shearwater.data <- sample.shearwater.data[round(sample.shearwater.data$vaf,2) >= 0.01,]
+    
+    # calculate mutation burden aka sum of vafs
+    mut.burden <- sum(sample.shearwater.data$vaf)
+    number.muts <- nrow(sample.shearwater.data)
+    
+    if(nrow(sample.shearwater.data) > 0){
+      
+       # create a sample table for storing the mitochondrial variants
+      sample.burden.table = data.frame("PatientID" = patient, "SampleID"= sample , "#Mutations_greater_1percentVAF" = number.muts, "mutation_burden" = mut.burden, check.names=F,
+                                       stringsAsFactors=F) 
+    } else {
+      
+      sample.burden.table = data.frame("PatientID" = patient, "SampleID"= sample , "#Mutations_greater_1percentVAF" = 0, "mutation_burden" = 0, check.names=F,
+                                       stringsAsFactors=F) 
+      
+    }
+    
+    pt.burden.table <- rbind(pt.burden.table, sample.burden.table)
+    
+  }
+  
+  # write to file
+  # remove the first row
+  pt.burden.table <- pt.burden.table[-1,]
+  blood.mut.burden[[i]] <- pt.burden.table
+  
+  cat("\nFinished Patient", patient,  "\n")
+  
+}
+
+# write to file
+blood.mut.burden <- bind_rows(blood.mut.burden)
+head(blood.mut.burden)
+```
+
+## CONVERT TREES TO ULTRAMETRIC TREES
+
+In order to construct the relatedness matrix to represent the phylogenetic tree, we need to make each tree ultrametric - that is, the tips of the trees all finish at the same point. 
+This is formally correct, since we are using mutation burden as a molecular clock, and we know that the different colonies studied were taken from the same individual (hence at the same age).
+Although there are existing methods for making trees ultrametric, they did not especially suit our purposes for somatic mutations in normal tissues. 
+We have more power for estimating the true number of early mutations (since they will be seen in more than one blood colongy, and on average at higher variant allele fraction). 
+Our observed estimates of branch length for the late, singleton branches will be less certain. Therefore, we developed a recursive function to place each branch-point (coalescence) on a given fraction of molecular time.
+Starting at the root of the tree, and progressing towards the tip, the position of each coalescence is estimated as the number of mutations acquired between root and that coalescence divided by that number plus the average
+of the number of mutations in branches descending from the coalescence.
+
+```{r}
+# Functions to convert a tree to an ultrametric tree
+
+find.distance <- function(tree, from, to) {
+  path <- nodepath(tree, from, to)
+  res <- 0
+  for (j in 2:length(path)) {
+    index <- which(tree$edge[,2] == path[j] & tree$edge[,1] == path[j-1], arr.ind = TRUE)
+    res <- res + tree$edge.length[index]
+  }
+  return(res)
+}
+
+length.normalise <- function(orig.tree, new.tree, curr.node, remaining.stick) {
+    curr.node.children <- unlist(Descendants(orig.tree, curr.node, "children"))
+
+    for (j in curr.node.children) {
+      index <- which(orig.tree$edge[,2] == j & orig.tree$edge[,1] == curr.node, arr.ind = TRUE)
+
+      if (j %in% orig.tree$tip.label) {
+        new.tree$edge.length[index] <- remaining.stick
+      } else {
+        curr.node.tips <- unlist(Descendants(orig.tree, j, "tips"))
+        curr.dist <- find.distance(orig.tree, curr.node, j)
+        if (curr.dist == 0) {curr.dist <- 0.5} # So that no edge lengths are zero
+        desc.lengths <- sapply(curr.node.tips, FUN = find.distance, tree = orig.tree, from = curr.node)
+        new.tree$edge.length[index] <- remaining.stick * curr.dist / mean(desc.lengths)
+        shorter.stick <- remaining.stick - new.tree$edge.length[index]
+
+        # Call as recursive function
+        new.tree <- length.normalise(orig.tree, new.tree, j, shorter.stick)
+      }
+    }
+    return(new.tree)
+} 
+
+make.ultrametric.tree <- function(tree) {
+    root.number <- length(tree$tip.label) + 1
+    ultra.tree <- length.normalise(tree, tree, root.number, 1)
+    return(ultra.tree)
+}
+```
+
+```{r, fig.width= 21, fig.height=8}
+# use the functions to make the foetal trees ultrametric
+ultra.blood_trees <- list()
+
+for (i in 1:length(blood_trees)) {
+    tree <- blood_trees[[i]]
+    tree$root.edge <- 0 # Make the tree rooted
+
+    ultra.blood_trees[[i]] <- make.ultrametric.tree(tree)
+}
+
+names(ultra.blood_trees) <- names(blood_trees)
+
+# visualize the trees in comparison
+# pdf("/Users/mp34/team154_campbell/plots/phylogenetic_tree_PD45534.pdf", width = 21, height = 16, useDingbats = FALSE)
+par(mfrow=c(2,1))
+plot(blood_trees[["PD45534"]], main=paste0(names(blood_trees)[7], ": observed"), direction="downwards", show.tip.label=F, no.margin = TRUE)
+axis(side = 2, line=-2)
+plot(ultra.blood_trees[["PD45534"]], main=paste0(names(ultra.blood_trees)[7], ": ultrametric"), direction="downwards", show.tip.label=F, no.margin = TRUE)
+axis(side = 2, line=-2)
+# dev.off()
+```
+
+## GENERATE DATA STRUCTURES FOR MCMC MIXED EFFECT MODELS
+
+Having made the trees ultrametric, we convert these into relatedness matrices for the MCMC model. 
+We do this using the inverseA() function of the MCMCglmm package. We also generate a data-frame of fixed effects for the model, with each row representing a separate clone of mutations at the tip of the phylogenetic trees.
+
+```{r}
+# read in sample data
+blood.sample.data <- fread("/Users/mp34/team154_campbell/data/blood_emily/Summary_cut.csv", sep = ",", header = T)
+
+# First generate the data structures for the model
+mtdna.copynumber.full <- data.frame() # A data-frame with each row representing a tip from the phylogeny
+invA.list <- list() # This will contain the inverse of the relatedness matrices for each patient for the MCMC model
+invA.row.names <- c()
+
+# Cycle through each patient
+i <- blood_ids[1]
+for (i in blood_ids) {
+  
+    tree <- ultra.blood_trees[[i]]
+    tree$node.label <- NULL
+    invA <- inverseA(tree, nodes="TIPS")$Ainv # The inverted relatedness matrix for that patient
+    invA.row.names <- c(invA.row.names, row.names(invA))
+    invA.list[[i]] <- invA
+    
+    # Now gather the data for the fixed effects into a data-frame
+    mtdna.copynumber.df <- blood_tree_dfs[[i]]
+    mtdna.copynumber.df <- mtdna.copynumber.df[mtdna.copynumber.df$SampleID %in% tree$tip.label,]
+    
+    # get the information on 
+    curr.tree <- blood_trees[[i]]
+    branch.lengths <- node.depth.edgelength(curr.tree)
+    
+    # add number of nuclear DNA mutations
+    names(branch.lengths) <- c(curr.tree$tip.label, curr.tree$node.label)
+    
+    # add age in weeks
+    mtdna.copynumber.df <- merge(mtdna.copynumber.df, blood.sample.data, by.x = "SampleID", by.y = "PDID", all.x = T)
+    mtdna.copynumber.df <- merge(mtdna.copynumber.df, blood_metadata, by.x = "donor_id", by.y = "Sample",  all.x = T)
+    
+    # subset to columns of interest
+    mtdna.copynumber.df <- mtdna.copynumber.df[, c("donor_id", "SampleID", "Length", "age", "cell_type", "number_mutations", "sub_adj", "tel_length", "PDID")]
+    
+    # add the copy number information
+    mtdna.copynumber.df <- merge(mtdna.copynumber.df, copynumber.file, by = c("SampleID"),  all.x = T)
+    colnames(mtdna.copynumber.df)[9] <- "PatientID"
+      
+    # add mitochondrial mutation burden
+    mtdna.copynumber.df <- merge(mtdna.copynumber.df, blood.mut.burden, by = c("PatientID", "SampleID"), all.x = T)
+    
+    # Add to the existing data-frame
+    mtdna.copynumber.full <- rbind(mtdna.copynumber.full, mtdna.copynumber.df)
+}
+
+# remove columns which are less interesting
+mtdna.copynumber.full <- mtdna.copynumber.full[, c("SampleID", "PatientID", "donor_id", "age", "cell_type", "number_mutations", "sub_adj", "tel_length", "copy_number", "normalized_copynumber", "#Mutations_greater_1percentVAF", "mutation_burden")]
+colnames(mtdna.copynumber.full) <- c("SampleID", "PatientID", "DonorID", "Age", "Cell_Type", "nDNA_muts", "adj_nDNA_muts", "tel_length", "copy_number", "adj_copy_number", "number_mtDNA_muts", "mtDNA_mut_burden")
+
+# Combine the individual patients' inverted relatedness matrices into one large block diagonal random effects matrix
+inverseA <- bdiag(invA.list)
+row.names(inverseA) <- invA.row.names
+
+# export the data
+# writeMM(inverseA, "/Users/mp34/team154_campbell/data/blood_emily/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
+# writeMM(inverseA, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/mcmc_model_inverseA.txt", sep = "\t", col.names = T, row.names = T, quote = F)
+# saveRDS(invA.row.names, "/Users/mp34/team154_campbell/data/blood_emily/mcmc_model_inverseA_rownames.RData")
+# saveRDS(invA.row.names, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/mcmc_model_inverseA_rownames.RData")
+
+head(mtdna.copynumber.full)
+```
+
+```{r}
+# replace NAs in mutation burden with 0
+mtdna.copynumber.full[is.na(mtdna.copynumber.full$number_mtDNA_muts), "mtDNA_mut_burden"] <- 0
+
+# subset to samples with mutation burden info
+mtdna.copynumber.complete <- mtdna.copynumber.full[!is.na(mtdna.copynumber.full$number_mtDNA_muts), ]
+mtdna.copynumber.complete <- mtdna.copynumber.complete[!is.na(mtdna.copynumber.complete$copy_number),]
+mtdna.copynumber.complete$Cell_Type <- factor(mtdna.copynumber.complete$Cell_Type, levels = c("Progenitor", "HSC"))
+
+# write to file
+# write.table(mtdna.copynumber.complete, "/Users/mp34/team154_campbell/data/blood_emily/mcmc_model_mtDNA_CopyNumber.txt", sep = "\t", col.names = T, row.names = F, quote = F)
+# write.table(mtdna.copynumber.complete, "/Users/mp34/sanger/team268im/analysis/mtdna_heritability/mcmc_model_mtDNA_CopyNumber_tissue_Celltype.txt", sep = "\t", col.names = T, row.names = F, quote = F)
+```
+
+
+## VISUALIZE MUTATION BURDEN VS AGE
+
+```{r}
+# add the age information to the blood mutation burden
+mut.burden.age.df <- mtdna.copynumber.complete
+
+# calculate median mutational burden per patient
+patient.mut.burden <- aggregate(mut.burden.age.df[,c("number_mtDNA_muts", "mtDNA_mut_burden", "Age", "copy_number")],
+                                list(mut.burden.age.df$PatientID), median)
+
+colnames(patient.mut.burden)[1] <- c("PatientID")
+
+# add pseudo columns to the patient mut dataframe
+patient.mut.burden$lower_ci <- NA
+patient.mut.burden$upper_ci <- NA
+
+# determine the patient list of interest
+patient_list <- unique(patient.mut.burden$PatientID)
+
+i <- 1
+for(i in 1:length(patient_list)){
+  
+  cat("Processing", patient_list[i], "...\n")
+  
+  # get all the sample data for the respective patient
+  boot.data <- mut.burden.age.df[which(mut.burden.age.df$PatientID==patient_list[i]),]
+  boot.data <- boot.data[!duplicated(boot.data),]
+  
+  if (nrow(boot.data) > 1){
+    
+    # calculate the median
+    boot.median = with(boot.data, median(mtDNA_mut_burden))
+    boot.median
+    
+    # bootstrap
+    Mboot = boot(boot.data$mtDNA_mut_burden,
+                 function(x,i) median(x[i]), 
+                 R=10000)
+    Mboot
+    plot(Mboot)
+    hist(Mboot$t[,1],col = "darkgray")
+    
+    
+    ### The mean based on the bootstrap method
+    median(Mboot$t[,1])
+    
+    # Four 95% confidence intervals are presented: normal, basic, percentile, and bias-corrected and accelerated.
+    CI <- boot.ci(Mboot,
+                  conf = 0.95, 
+                  type = c("norm", "basic", "perc", "bca")
+    )
+    CI
+    
+    # Going with percentile CI
+    patient.mut.burden$lower_ci[which(patient.mut.burden$PatientID == patient_list[i])] <- as.numeric(CI$percent[4])
+    patient.mut.burden$upper_ci[which(patient.mut.burden$PatientID == patient_list[i])] <- as.numeric(CI$percent[5])
+    
+  } else {
+    
+    cat("Patient", patient_list[i], "has only one sample!\n")
+    
+    # Going with percentile CI
+    patient.mut.burden$lower_ci[which(patient.mut.burden$PatientID == patient_list[i])] <- 0
+    patient.mut.burden$upper_ci[which(patient.mut.burden$PatientID == patient_list[i])] <- 0
+    
+  }
+}
+
+#####################################################################################
+# PLOT MTDNA VS AGE
+#####################################################################################
+
+ggplot(patient.mut.burden, aes(x=Age, y = mtDNA_mut_burden, ymin = lower_ci, ymax = upper_ci)) +
+  geom_linerange(position= position_dodge2(width=0.75), size = 0.5, color="darkgrey") +
+  geom_point(position=position_dodge2(width=0.75), aes(color = PatientID)) +
+  theme_classic() +
+  geom_smooth(method=lm, color="darkblue") +
+  stat_cor(method = "pearson") +
+  labs(x="Donor age [years]",
+       y="Median mutation burden (Sum[VAF])") + 
+  theme(legend.position="right") +
+  theme(axis.text = element_text(colour = "black", size = 12, face = "bold" ),
+        axis.text.x = element_text(colour = "black", size = 12, face = "bold" ),
+        axis.title = element_text(colour = "black", size = 16, face = "bold" ),
+        plot.title = element_text(colour = "black", size = 16, face = "bold", hjust = 0.5),
+        legend.title = element_text(color = "black", size = 12, face = "bold",),
+        legend.text = element_text(colour="black", size=10, face="bold"))
+ggsave("/Users/mp34/team154_campbell/plots/blood_emily_mutation_burden_vs_age.pdf", width = 7, height = 5, dpi = 600)
+
+```
+
+## VISUALIZE COPY NUMBER VS AGE
+
+```{r}
+# calculate median mutational burden per patient
+patient.copyNumber <- aggregate(mut.burden.age.df[,c("number_mtDNA_muts", "mtDNA_mut_burden", "Age", "copy_number")],
+                                list(mut.burden.age.df$PatientID), median)
+colnames(patient.copyNumber)[1] <- c("PatientID")
+
+# add pseudo columns to the patient mut dataframe
+patient.copyNumber$lower_ci <- NA
+patient.copyNumber$upper_ci <- NA
+
+# determine the patient list of interest
+patient_list <- unique(patient.copyNumber$PatientID)
+
+i <- 1
+for(i in 1:length(patient_list)){
+  
+  cat("Processing", patient_list[i], "...\n")
+  
+  # get all the sample data for the respective patient
+  boot.data <- mut.burden.age.df[which(mut.burden.age.df$PatientID==patient_list[i]),]
+  boot.data <- boot.data[!duplicated(boot.data),]
+  
+  if (nrow(boot.data) > 1){
+    
+    # calculate the median
+    boot.median = with(boot.data, median(copy_number))
+    boot.median
+    
+    # bootstrap
+    Mboot = boot(boot.data$copy_number,
+                 function(x,i) median(x[i]), 
+                 R=10000)
+    Mboot
+    plot(Mboot)
+    hist(Mboot$t[,1],col = "darkgray")
+    
+    
+    ### The mean based on the bootstrap method
+    median(Mboot$t[,1])
+    
+    # Four 95% confidence intervals are presented: normal, basic, percentile, and bias-corrected and accelerated.
+    CI <- boot.ci(Mboot,
+                  conf = 0.95, 
+                  type = c("norm", "basic", "perc", "bca")
+    )
+    CI
+    
+    # Going with percentile CI
+    patient.copyNumber$lower_ci[which(patient.copyNumber$PatientID == patient_list[i])] <- as.numeric(CI$percent[4])
+    patient.copyNumber$upper_ci[which(patient.copyNumber$PatientID == patient_list[i])] <- as.numeric(CI$percent[5])
+    
+  } else {
+    
+    cat("Patient", patient_list[i], "has only one sample!\n")
+    
+    # Going with percentile CI
+    patient.copyNumber$lower_ci[which(patient.copyNumber$PatientID == patient_list[i])] <- 0
+    patient.copyNumber$upper_ci[which(patient.copyNumber$PatientID == patient_list[i])] <- 0
+    
+  }
+}
+
+#####################################################################################
+# PLOT MTDNA COPY NUMBER VS AGE
+#####################################################################################
+
+ggplot(patient.copyNumber, aes(x=Age, y = copy_number, ymin = lower_ci, ymax = upper_ci)) +
+  geom_linerange(position= position_dodge2(width=0.75), size = 0.5, color="darkgrey") +
+  geom_point(position=position_dodge2(width=0.75), aes(color = PatientID)) +
+  theme_classic() +
+  geom_smooth(method=lm, color="darkblue") +
+  stat_cor(method = "pearson") +
+  labs(x="Donor age [years]",
+       y="Median mtDNA copy number") + 
+  theme(legend.position="right") +
+  theme(axis.text = element_text(colour = "black", size = 12, face = "bold" ),
+        axis.text.x = element_text(colour = "black", size = 12, face = "bold" ),
+        axis.title = element_text(colour = "black", size = 16, face = "bold" ),
+        plot.title = element_text(colour = "black", size = 16, face = "bold", hjust = 0.5),
+        legend.title = element_text(color = "black", size = 12, face = "bold",),
+        legend.text = element_text(colour="black", size=10, face="bold"))
+ggsave("/Users/mp34/team154_campbell/plots/blood_emily_median_copyNumber_vs_age.pdf", width = 7, height = 5, dpi = 600)
+
+```
+
+```{r}
+# Generate a scatter-plot of mtDNA copy number for each clone from the cohort, ordered by disease and patient
+plotting.df <- mtdna.copynumber.complete[order(mtdna.copynumber.complete$SampleID, mtdna.copynumber.complete$Age),]
+plotting.df <- plotting.df %>% group_by(PatientID) %>% mutate(median_mut_burden = median(mtDNA_mut_burden))
+plotting.df <- plotting.df %>% group_by(PatientID) %>% mutate(median_copynumber = median(copy_number))
+
+## COPY NUMBER
+ggplot(plotting.df, aes(PatientID, copy_number, color = Cell_Type)) +
+  geom_jitter() + 
+  theme_classic() + 
+  facet_wrap(~ PatientID, scales='free_x', nrow = 1) +
+  theme(axis.text.x = element_text(angle=65, vjust=0.6)) + 
+  # scale_y_log10() +
+  geom_hline(aes(yintercept = median_copynumber, group = PatientID), colour = 'red', size = 2) +
+  labs(x="",
+       y="mtDNA copy number") + 
+  theme(strip.text = element_text(face="bold", size=16, colour = "black",),
+        strip.background = element_rect(fill="lightgrey", colour="black", size=1),
+        axis.text.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = 0.5, face = "bold"),
+        axis.text.y = element_text(color = "black", size = 12, angle = 0, hjust = 1, vjust = 0, face = "bold"),  
+        axis.title.x = element_text(color = "black", size = 16, angle = 0, hjust = .5, vjust = 0, face = "bold"),
+        axis.title.y = element_text(color = "black", size = 16, angle = 90, hjust = .5, vjust = .5, face = "bold", 
+                                    margin = margin(t = 0, r = 10, b = 0, l = 0)), 
+        plot.title = element_text(color = "black", size = 12, hjust = .5, face = "bold"), 
+        legend.position = "none")
+# ggsave("/Users/mp34/team268_martincorena/plots/blood_emily_CopyNumber.pdf", width = 20, height = 6, dpi = 600)
+
+## LOG COPY NUMBER
+ggplot(plotting.df, aes(PatientID, log10(copy_number), color = SampleID)) +
+  geom_jitter() + 
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle=65, vjust=0.6)) + 
+  scale_y_log10() +
+  labs(x="",
+       y="mtDNA copy number [log10]") + 
+  theme(strip.text = element_text(face="bold", size=10, colour = "black",),
+        strip.background = element_rect(fill="lightgrey", colour="black", size=1),
+        axis.text.x = element_text(color = "black", size = 10, angle = 0, hjust = .5, vjust = 0.5, face = "bold"),
+        axis.text.y = element_text(color = "black", size = 10, angle = 0, hjust = 1, vjust = 0, face = "bold"),  
+        axis.title.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = 0, face = "bold"),
+        axis.title.y = element_text(color = "black", size = 12, angle = 90, hjust = .5, vjust = .5, face = "bold", 
+                                    margin = margin(t = 0, r = 10, b = 0, l = 0)), 
+        plot.title = element_text(color = "black", size = 12, hjust = .5, face = "bold"), 
+        legend.position = "none")
+# ggsave("/Users/mp34/team268_martincorena/plots/blood_emily_log10_CopyNumber.pdf", width = 8, height = 10, dpi = 600)
+
+## MUTATION BURDEN
+# create dataframe with index to order samples along x axis 
+ordered.blood.mut.burden <- plotting.df %>% group_by(PatientID) %>% arrange(PatientID, mtDNA_mut_burden) %>% mutate(index = row_number(PatientID))
+
+ggplot(ordered.blood.mut.burden, aes(index, mtDNA_mut_burden, color = Cell_Type)) +
+  geom_point() + 
+  theme_classic() +
+  facet_wrap(~ PatientID, scales='free_x', nrow = 1) +
+  theme(axis.text.x = element_text(angle=65, vjust=0.6)) + 
+  labs(title="mtDNA mutation burden in adult blood samples",
+       x="Samples",
+       y="Mutation Burden (Sum[VAF])") + 
+  geom_hline(aes(yintercept = median_mut_burden, group = PatientID), colour = 'red', size = 2) +
+  theme(strip.text = element_text(face="bold", size=16, colour = "black",),
+        strip.background = element_rect(fill="lightgrey", colour="black", size=1),
+        axis.text.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = 0.5, face = "bold"),
+        axis.text.y = element_text(color = "black", size = 12, angle = 0, hjust = 1, vjust = 0, face = "bold"),  
+        axis.title.x = element_text(color = "black", size = 16, angle = 0, hjust = .5, vjust = 0, face = "bold"),
+        axis.title.y = element_text(color = "black", size = 16, angle = 90, hjust = .5, vjust = .5, face = "bold", 
+                                    margin = margin(t = 0, r = 10, b = 0, l = 0)), 
+        plot.title = element_text(color = "black", size = 12, hjust = .5, face = "bold"), 
+        legend.position = "bottom")
+# ggsave("/Users/mp34/team154_campbell/plots/blood_emily_mutation_burden.pdf", width = 20, height = 6, dpi = 600)
+
+```
+
+## PLOT PHYLOGENIES COLOURED BY MTDNA COPY NUMBER
+
+To obtain a visual appreciation for how heritable telomere lengths are, we can plot the phylogenetic trees with branches coloured by telomere lengths (yellow for short telomere lengths, green for average and blue/indigo for long telomeres. This shows that, on average, more closely related clones tend to have more similar telomere lengths than unrelated clones.
+
+```{r, fig.height = 8, fig.width = 21} 
+# pdf("/Users/mp34/team268_martincorena/plots/blood_emily_mtDNA_copyNumber_on_trees.pdf", width = 21, height = 8, useDingbats = FALSE)
+par(mfrow=c(1,1))
+adapted.blood_ids <- blood_ids[-1]
+# i <- adapted.blood_ids[[6]]
+temp <- lapply(adapted.blood_ids, function(i) {
+  
+    mtdna.cn <- mtdna.copynumber.full[grep(i, mtdna.copynumber.full$PatientID), "copy_number"]
+    names(mtdna.cn) <- mtdna.copynumber.full[grep(i, mtdna.copynumber.full$PatientID), "SampleID"]
+   
+    tree <- multi2di(ultra.blood_trees[[i]])
+    tree <- collapse.singles(tree)
+    mtdna.cn <- mtdna.cn[tree$tip.label]
+    mtdna.cn[is.na(mtdna.cn)] <- 1
+    mtdna.cn <- log10(mtdna.cn)
+    names(mtdna.cn) <- tree$tip.label
+    
+    obj <- contMap(tree, x = mtdna.cn, lwd=0.5, cex=0.01, type = "phylogram", show.tip.label = FALSE, plot=FALSE)
+    obj$cols[1:length(obj$cols)] <- rev(viridis(length(obj$cols)))
+    plot(obj,type="phylogram", direction = "downwards", legend=FALSE, no.margin = TRUE, fsize=c(0.5,1), fsize=0.9, outline=TRUE, lwd=1.5, ftype = "off")
+    title(i, line=-1, font = 10)
+    axis(side = 1, line=-2)
+    add.color.bar(50, obj$cols, title="mtDNA copy number", lims=obj$lims, x = -1, y = 1, digits=3, prompt=FALSE, lwd=4,fsize=1,subtitle="")
+})
+
+# dev.off()
+
+```
+
+## PLOT PHYLOGENIES COLOURED BY MTDNA MUTATION BURDEN
+
+```{r, fig.height = 8, fig.width = 21} 
+# pdf("/Users/mp34/team154_campbell/plots/mtDNA_burden_on_blood_emily_trees.pdf", width = 21, height = 8, useDingbats = FALSE)
+par(mfrow=c(1,1))
+# additional patient has to be excluded since the mutation burden = 0 for all samples
+adapted.blood_ids <- adapted.blood_ids[-7]
+
+# i <- adapted.blood_ids[[7]]
+temp <- lapply(adapted.blood_ids, function(i) {
+  
+    mtdna.burden <- mut.burden.age.df[grep(i, mut.burden.age.df$PatientID), "mtDNA_mut_burden"]
+    names(mtdna.burden) <- mut.burden.age.df[grep(i, mut.burden.age.df$PatientID), "SampleID"]
+    
+    tree <- multi2di(ultra.blood_trees[[i]])
+    tree <- collapse.singles(tree)
+    mtdna.burden <- mtdna.burden[tree$tip.label]
+    mtdna.burden[is.na(mtdna.burden)] <- 0
+    names(mtdna.burden) <- tree$tip.label
+    
+    obj <- contMap(tree, x = mtdna.burden, lwd=0.5, cex=0.01, type="fan", show.tip.label = FALSE, plot=FALSE)
+    obj$cols[1:length(obj$cols)] <- rev(magma(length(obj$cols)))
+    plot(obj,type="phylogram", direction = "downwards", legend=FALSE, no.margin = TRUE, fsize=c(0.5,1), fsize=0.9, outline=TRUE, lwd=1.5, ftype = "off")
+    title(i, line=-1, font = 10)
+    axis(side = 1, line=-2)
+    add.color.bar(30, obj$cols, title="mtDNA mutation burden", lims=obj$lims, x = 1, y = 1, digits=3, prompt=FALSE, lwd=4,fsize=1,subtitle="")
+})
+
+# dev.off()
+
+```
+
+## FIT MCMC MIXED EFFECTS MODEL
+
+We use a Bayesian linear mixed effects model to model mitochondrial copy number. The dependent variable is the average mtDNA copy number ('cop_number') of each sample and expected to follow a Gaussian distribution. The fixed effects are: Aetiology (dummy variables for ARLD and NAFLD); Age of patient (in years); Number of mutations in that clone; and Clone area. We fit a random effect for each patient and a random effect for the phylogenetic relationships encoded in the 'inverseA' block diagonal matrix. The priors are uninformative inverse-Wishart distributions. We run the MCMC chain for 11,000,000 iterations with 1,000,000 of these as a burn-in, thinned to every 1000 iterations.
+
+```{r}
+
+# # Run model
+# set.seed(28)
+# prior <- list(R=list(V=1, nu=0.002), G=list(G1=list(V=1, nu=0.002), G2=list(V=1, nu=0.002)))
+# 
+# model <- MCMCglmm(copy_number ~ Cell_Type + Age + mtDNA_mut_burden, 
+#                   random = ~ SampleID + PatientID, 
+#                   ginverse=list(SampleID = inverseA), family="gaussian", 
+#                   data=mtdna.copynumber.complete, prior=prior, verbose=FALSE, nitt = 16000000, burnin = 1000000, thin = 1000)
+
+```
+
+## CHECK DIAGNOSTICS
+
+We check the usual diagnostics on the MCMC chain - these show (1) there are no systematic trends in the variables after the burn-in has completed (the burn-in is of sufficient length); (2) autocorrelation is relatively low among adjacent estimates with the thinning to every 1000th instance of the chain; (3) diagnostic tests of convergence are all passed.
+
+```{r}
+# load the model
+model <- readRDS("/Users/mp34/sanger/team268im/analysis/mtdna_heritability/mcmc_model_cellType_Age_mtDNA_allSamples.RData")
+
+# Diagnostics
+plot(model$Sol)
+plot(model$VCV)
+autocorr.diag(model$Sol)
+autocorr.diag(model$VCV)
+effectiveSize(model$Sol)
+effectiveSize(model$VCV)
+heidel.diag(model$VCV)
+```
+
+## SUMMARY OF MODEL
+
+The model overall shows a substantial decrease in telomere lengths in patients with ARLD and NAFLD compared to normal control patients, in the order of ~400-600bp shorter on average. These effect sizes for disease considerably outweighed the relatively minor shortening of telomere lengths with age. There is also a strongly significant decrease in telomere lengths with increasing clone size.
+
+
+```{r}
+summary(model)
+```
+
+## ESTIMATING 'SOMATIC HERITABILITY'
+
+We can derive estimates for the 'somatic heritability' of telomere lengths by calculating the component of variance in the random effects that is attributed to the variable describing phylogenetic relationships versus the residual variance and variance attributed to between-patient effects.
+The estimate of ‘somatic heritability’ for telomere lengths is 21% (95% posterior interval = 0-44%) – that is, once the effects of age, disease and clone size have been accounted for, ~21% of the residual variation in telomere lengths across the cohort can be explained by the phylogenetic relationships among clones. However, there is some instability in this estimate, and maybe about 26% of iterations of the MCMC chain suggest no somatic heritability.
+
+## ESTIMATING 'SOMATIC HERITABILITY'
+
+We can derive estimates for the 'somatic heritability' of telomere lengths by calculating the component of variance in the random effects that is attributed to the variable describing phylogenetic relationships versus the residual variance and variance attributed to between-patient effects.
+The estimate of ‘somatic heritability’ for telomere lengths is 21% (95% posterior interval = 0-44%) – that is, once the effects of age, disease and clone size have been accounted for, ~21% of the residual variation in telomere lengths across the cohort can be explained by the phylogenetic relationships among clones. However, there is some instability in this estimate, and maybe about 26% of iterations of the MCMC chain suggest no somatic heritability.
+
+```{r}
+herit <- model$VCV[, "SampleID"] / rowSums(model$VCV)
+effectiveSize(herit)
+mean(herit)
+HPDinterval(herit)
+plot(herit)
+sum(herit < 0.05) / length(herit)
+```
+
+## GERNEATE PLOTS OF THE POSTERIOR DISTRIBUTION OF FIXED EFFECTS AND HERTIABTILITY
+
+```{r}
+mtdna.mcmc <- as.data.frame(model$Sol)
+
+mtdna.melt <- reshape2::melt(data = mtdna.mcmc, measure.vars = names(mtdna.mcmc))
+
+mtdna.melt <- mtdna.melt[mtdna.melt$variable != "(Intercept)",]
+
+# Generate density plots
+# pdf("/Users/mp34/team154_campbell/plots/blood_emily_posterior_density_plots.pdf", width = 8, height = 6, useDingbats = FALSE)
+ggplot(mtdna.melt, aes(x = as.numeric(value), y = variable, fill = factor(stat(quantile)))) + 
+    stat_density_ridges(geom = "density_ridges_gradient", calc_ecdf = TRUE,
+                        quantiles = 10, quantile_lines = FALSE, scale=2.5) +
+    scale_fill_manual(values = c(brewer.pal(5, "Reds"), rev(brewer.pal(5,"Reds"))), 
+                        aesthetics = "fill", name = "Deciles", 
+                        labels = paste(seq(0,90,10), seq(10,100,10), sep="-")) +
+    xlab("Change in mtDNA copy number") +
+    theme(axis.title.y=element_blank(),
+        panel.background = element_blank(), 
+        panel.grid = element_line(colour = "lightgrey"),
+        panel.grid.minor = element_blank())
+# dev.off()
+```
+
+```{r}
+# Plot the posterior density of heritability
+mtdna.herit <- data.frame(herit, variable = rep("Heritability", length(herit)))
+ggplot(mtdna.herit, aes(x = var1, y = variable, fill = factor(stat(quantile)))) + 
+    stat_density_ridges(geom = "density_ridges_gradient", calc_ecdf = TRUE,
+                        quantiles = 10, quantile_lines = FALSE, scale=4, bandwidth=0.02) +
+    scale_fill_manual(values = c(brewer.pal(5, "Reds"), rev(brewer.pal(5,"Reds"))), 
+                        aesthetics = "fill", name = "Deciles", 
+                        labels = paste(seq(0,90,10), seq(10,100,10), sep="-")) +
+    xlab("Somatic heritability (%)") +
+    theme(axis.title.y=element_blank(),
+        panel.background = element_blank(), 
+        panel.grid = element_line(colour = "lightgrey"),
+        panel.grid.minor = element_blank())
+# ggsave("/Users/mp34/team154_campbell/plots/blood_emily_somaticHeritability.pdf", width = 10, height = 5, dpi = 600)
+```
+
+## SESSION INFORMATION
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
