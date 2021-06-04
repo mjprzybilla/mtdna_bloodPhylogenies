@@ -22,5 +22,7 @@ It should be noted that the scripts for the generation and analysis of the under
 
 **Supplementary_Figure04** - Example phylogenetic tree for the adult blood data with matched mutation burden and mitochondrial copy number.
 
-**Supplementary_Figure05** - Histogram of mtDNA copy number in foetal and adult blood.
+**Supplementary_Figure05** - Shared mitochondrial SNVs in adult blood.
+
+**Supplementary_Figure06** - Histogram of mtDNA copy number in foetal and adult blood.
 
